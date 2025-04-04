@@ -224,3 +224,140 @@
             (merge current-stats
                   {games-played: (+ (get games-played current-stats) u1)}))))
 )
+
+
+;; Add to Data Variables
+(define-map daily-rewards
+    { player: principal }
+    { last-claim: uint,
+      consecutive-days: uint }
+)
+
+(define-constant daily-reward-amount u100)
+(define-constant blocks-per-day u144) ;; Assuming 1 block per 10 minutes
+
+(define-public (claim-daily-reward)
+    (let (
+        (current-block (unwrap-panic (get-stacks-block-info? time u0)))
+        (last-claim-data (default-to {last-claim: u0, consecutive-days: u0} 
+                         (map-get? daily-rewards {player: tx-sender})))
+    )
+    (begin
+        (asserts! (> current-block (+ (get last-claim last-claim-data) blocks-per-day)) (err u200))
+        (ok (map-set daily-rewards
+            {player: tx-sender}
+            {last-claim: current-block,
+             consecutive-days: (+ (get consecutive-days last-claim-data) u1)}))))
+)
+
+
+;; Add to Data Variables
+(define-map crafting-recipes
+    { recipe-id: uint }
+    { ingredients: (list 3 uint),
+      result: uint,
+      required-level: uint }
+)
+
+(define-constant err-insufficient-level (err u103))
+(define-constant err-missing-ingredients (err u104))
+
+(define-public (craft-item (recipe-id uint))
+    (let (
+        (recipe (unwrap! (map-get? crafting-recipes {recipe-id: recipe-id}) err-not-found))
+        (player-inv (unwrap! (map-get? player-assets {player: tx-sender}) err-not-found))
+        (player-level (get level (unwrap! (map-get? player-xp {player: tx-sender}) err-not-found)))
+    )
+    (begin
+        (asserts! (>= player-level (get required-level recipe)) err-insufficient-level)
+        ;; Check ingredients and craft logic would go here
+        (ok true)))
+)
+
+;; Add to Data Variables
+(define-map marketplace-listings
+    { listing-id: uint }
+    { seller: principal,
+      asset-id: uint,
+      price: uint,
+      active: bool }
+)
+
+(define-data-var next-listing-id uint u0)
+
+(define-public (create-listing (asset-id uint) (price uint))
+    (let ((listing-id (var-get next-listing-id)))
+    (begin
+        (var-set next-listing-id (+ listing-id u1))
+        (ok (map-set marketplace-listings
+            {listing-id: listing-id}
+            {seller: tx-sender,
+             asset-id: asset-id,
+             price: price,
+             active: true}))))
+)
+
+(define-public (buy-listing (listing-id uint))
+    (let ((listing (unwrap! (map-get? marketplace-listings {listing-id: listing-id}) err-not-found)))
+    (begin
+        (asserts! (get active listing) err-not-found)
+        (try! (ft-transfer? game-coins (get price listing) tx-sender (get seller listing)))
+        (ok (map-set marketplace-listings
+            {listing-id: listing-id}
+            (merge listing {active: false})))))
+)
+
+
+;; Add to Data Variables
+(define-map achievements
+    { achievement-id: uint }
+    { name: (string-ascii 50),
+      description: (string-ascii 100),
+      tier: uint,
+      required-value: uint }
+)
+
+(define-map player-achievement-progress
+    { player: principal, achievement-id: uint }
+    { current-value: uint,
+      completed: bool }
+)
+
+(define-public (check-achievement (achievement-id uint))
+    (let (
+        (achievement (unwrap! (map-get? achievements {achievement-id: achievement-id}) err-not-found))
+        (progress (default-to {current-value: u0, completed: false} 
+                  (map-get? player-achievement-progress {player: tx-sender, achievement-id: achievement-id})))
+    )
+    (begin
+        (asserts! (not (get completed progress)) err-already-exists)
+        (ok (map-set player-achievement-progress
+            {player: tx-sender, achievement-id: achievement-id}
+            {current-value: (+ (get current-value progress) u1),
+             completed: (>= (+ (get current-value progress) u1) (get required-value achievement))}))))
+)
+
+
+;; Add to Data Variables
+(define-map leaderboard-scores
+    { player: principal }
+    { score: uint,
+      last-updated: uint }
+)
+
+(define-public (update-leaderboard-score (new-score uint))
+    (let (
+        (current-block (unwrap-panic (get-stacks-block-info? time u0)))
+        (current-entry (default-to {score: u0, last-updated: u0} 
+                       (map-get? leaderboard-scores {player: tx-sender})))
+    )
+    (ok (map-set leaderboard-scores
+        {player: tx-sender}
+        {score: (+ (get score current-entry) new-score),
+         last-updated: current-block})))
+)
+
+(define-read-only (get-player-rank (player principal))
+    (ok (map-get? leaderboard-scores {player: player}))
+)
+
