@@ -361,3 +361,81 @@
     (ok (map-get? leaderboard-scores {player: player}))
 )
 
+
+
+(define-map lending-contracts
+    { loan-id: uint }
+    { lender: principal,
+      borrower: (optional principal),
+      asset-id: uint,
+      duration: uint,
+      fee: uint,
+      start-block: uint,
+      active: bool }
+)
+
+(define-data-var next-loan-id uint u0)
+
+(define-public (create-loan-offer (asset-id uint) (duration uint) (fee uint))
+    (let ((loan-id (var-get next-loan-id)))
+    (begin
+        (var-set next-loan-id (+ loan-id u1))
+        (ok (map-set lending-contracts
+            {loan-id: loan-id}
+            {lender: tx-sender,
+             borrower: none,
+             asset-id: asset-id,
+             duration: duration,
+             fee: fee,
+             start-block: u0,
+             active: true}))))
+)
+
+(define-public (accept-loan (loan-id uint))
+    (let ((loan (unwrap! (map-get? lending-contracts {loan-id: loan-id}) err-not-found)))
+    (begin
+        (asserts! (get active loan) err-not-found)
+        (try! (ft-transfer? game-coins (get fee loan) tx-sender (get lender loan)))
+        (ok (map-set lending-contracts
+            {loan-id: loan-id}
+            (merge loan 
+                {borrower: (some tx-sender),
+                 start-block: stacks-block-height,
+                 active: true})))))
+)
+
+
+(define-map fusion-recipes
+    { recipe-id: uint }
+    { input-assets: (list 3 uint),
+      output-asset: uint,
+      fusion-cost: uint }
+)
+
+(define-constant err-fusion-failed (err u300))
+
+(define-public (register-fusion-recipe (recipe-id uint) (inputs (list 3 uint)) (output uint) (cost uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-set fusion-recipes
+            {recipe-id: recipe-id}
+            {input-assets: inputs,
+             output-asset: output,
+             fusion-cost: cost})))
+)
+
+(define-public (fuse-assets (recipe-id uint))
+    (let ((recipe (unwrap! (map-get? fusion-recipes {recipe-id: recipe-id}) err-not-found))
+          (player-data (unwrap! (map-get? player-assets {player: tx-sender}) err-not-found)))
+        (begin
+            (try! (ft-transfer? game-coins (get fusion-cost recipe) tx-sender contract-owner))
+            (ok (map-set player-assets
+                {player: tx-sender}
+                (merge player-data
+                    {inventory: (unwrap! (as-max-len? 
+                        (append (get inventory player-data) (get output-asset recipe)) u10) 
+                        err-fusion-failed)}))))))
+
+
+
+
