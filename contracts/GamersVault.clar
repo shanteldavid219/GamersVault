@@ -19,6 +19,59 @@
 )
 
 
+;; Tournament System Constants
+(define-constant err-tournament-full (err u400))
+(define-constant err-tournament-not-active (err u401))
+(define-constant err-not-participant (err u402))
+(define-constant err-match-not-ready (err u403))
+(define-constant err-invalid-winner (err u404))
+
+;; Tournament Data Variables
+(define-data-var next-tournament-id uint u0)
+(define-data-var next-match-id uint u0)
+
+;; Tournament Structure
+(define-map tournaments
+    { tournament-id: uint }
+    { name: (string-ascii 50),
+      creator: principal,
+      entry-fee: uint,
+      prize-pool: uint,
+      max-participants: uint,
+      current-participants: uint,
+      status: (string-ascii 20),
+      start-block: uint,
+      winner: (optional principal) }
+)
+
+;; Tournament Participants
+(define-map tournament-participants
+    { tournament-id: uint, participant: principal }
+    { joined-block: uint,
+      eliminated: bool,
+      current-round: uint }
+)
+
+;; Tournament Matches
+(define-map tournament-matches
+    { match-id: uint }
+    { tournament-id: uint,
+      round: uint,
+      player1: principal,
+      player2: principal,
+      winner: (optional principal),
+      completed: bool }
+)
+
+;; Tournament Rounds Tracking
+(define-map tournament-rounds
+    { tournament-id: uint, round: uint }
+    { matches-total: uint,
+      matches-completed: uint,
+      active: bool }
+)
+
+
 
 (define-map asset-details
     { asset-id: uint }
@@ -438,4 +491,163 @@
 
 
 
+;; Create Tournament
+(define-public (create-tournament (name (string-ascii 50)) (entry-fee uint) (max-participants uint))
+    (let ((tournament-id (var-get next-tournament-id)))
+        (begin
+            (var-set next-tournament-id (+ tournament-id u1))
+            (ok (map-set tournaments
+                { tournament-id: tournament-id }
+                { name: name,
+                  creator: tx-sender,
+                  entry-fee: entry-fee,
+                  prize-pool: u0,
+                  max-participants: max-participants,
+                  current-participants: u0,
+                  status: "registration",
+                  start-block: u0,
+                  winner: none }))))
+)
 
+;; Join Tournament
+(define-public (join-tournament (tournament-id uint))
+    (let ((tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-not-found)))
+        (begin
+            (asserts! (is-eq (get status tournament) "registration") err-tournament-not-active)
+            (asserts! (< (get current-participants tournament) (get max-participants tournament)) err-tournament-full)
+            (asserts! (is-none (map-get? tournament-participants { tournament-id: tournament-id, participant: tx-sender })) err-already-exists)
+            (try! (ft-transfer? game-coins (get entry-fee tournament) tx-sender contract-owner))
+            (map-set tournament-participants
+                { tournament-id: tournament-id, participant: tx-sender }
+                { joined-block: stacks-block-height,
+                  eliminated: false,
+                  current-round: u1 })
+            (ok (map-set tournaments
+                { tournament-id: tournament-id }
+                (merge tournament 
+                    { current-participants: (+ (get current-participants tournament) u1),
+                      prize-pool: (+ (get prize-pool tournament) (get entry-fee tournament)) })))))
+)
+
+;; Start Tournament
+(define-public (start-tournament (tournament-id uint))
+    (let ((tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get creator tournament)) err-owner-only)
+            (asserts! (is-eq (get status tournament) "registration") err-tournament-not-active)
+            (asserts! (>= (get current-participants tournament) u2) (err u405))
+            (try! (generate-first-round-matches tournament-id))
+            (ok (map-set tournaments
+                { tournament-id: tournament-id }
+                (merge tournament 
+                    { status: "active",
+                      start-block: stacks-block-height })))))
+)
+
+;; Generate First Round Matches
+(define-private (generate-first-round-matches (tournament-id uint))
+    (let ((tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-not-found))
+          (participant-count (get current-participants tournament)))
+        (begin
+            (map-set tournament-rounds
+                { tournament-id: tournament-id, round: u1 }
+                { matches-total: (/ participant-count u2),
+                  matches-completed: u0,
+                  active: true })
+            (ok true)))
+)
+
+;; Create Match
+(define-public (create-match (tournament-id uint) (round uint) (player1 principal) (player2 principal))
+    (let ((match-id (var-get next-match-id)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (var-set next-match-id (+ match-id u1))
+            (ok (map-set tournament-matches
+                { match-id: match-id }
+                { tournament-id: tournament-id,
+                  round: round,
+                  player1: player1,
+                  player2: player2,
+                  winner: none,
+                  completed: false }))))
+)
+
+;; Report Match Result
+(define-public (report-match-result (match-id uint) (winner principal))
+    (let ((match (unwrap! (map-get? tournament-matches { match-id: match-id }) err-not-found))
+          (tournament (unwrap! (map-get? tournaments { tournament-id: (get tournament-id match) }) err-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get creator tournament)) err-owner-only)
+            (asserts! (not (get completed match)) err-already-exists)
+            (asserts! (or (is-eq winner (get player1 match)) (is-eq winner (get player2 match))) err-invalid-winner)
+            (map-set tournament-matches
+                { match-id: match-id }
+                (merge match { winner: (some winner), completed: true }))
+            (try! (update-round-progress (get tournament-id match) (get round match)))
+            (ok true)))
+)
+
+;; Update Round Progress
+(define-private (update-round-progress (tournament-id uint) (round uint))
+    (let ((round-data (unwrap! (map-get? tournament-rounds { tournament-id: tournament-id, round: round }) err-not-found)))
+        (begin
+            (map-set tournament-rounds
+                { tournament-id: tournament-id, round: round }
+                (merge round-data { matches-completed: (+ (get matches-completed round-data) u1) }))
+            (if (is-eq (+ (get matches-completed round-data) u1) (get matches-total round-data))
+                (advance-tournament-round tournament-id round)
+                (ok true))))
+)
+
+;; Advance Tournament Round
+(define-private (advance-tournament-round (tournament-id uint) (current-round uint))
+    (let ((remaining-players (get-round-winners tournament-id current-round)))
+        (if (is-eq (len remaining-players) u1)
+            (complete-tournament tournament-id (unwrap-panic (element-at remaining-players u0)))
+            (begin
+                (map-set tournament-rounds
+                    { tournament-id: tournament-id, round: (+ current-round u1) }
+                    { matches-total: (/ (len remaining-players) u2),
+                      matches-completed: u0,
+                      active: true })
+                (ok true))))
+)
+
+;; Get Round Winners (simplified - would need proper implementation)
+(define-private (get-round-winners (tournament-id uint) (round uint))
+    (list tx-sender)
+)
+
+;; Complete Tournament
+(define-private (complete-tournament (tournament-id uint) (winner principal))
+    (let ((tournament (unwrap! (map-get? tournaments { tournament-id: tournament-id }) err-not-found)))
+        (begin
+            (try! (ft-mint? game-coins (get prize-pool tournament) winner))
+            (ok (map-set tournaments
+                { tournament-id: tournament-id }
+                (merge tournament 
+                    { status: "completed",
+                      winner: (some winner) })))))
+)
+
+;; Read-only Functions
+(define-read-only (get-tournament-info (tournament-id uint))
+    (ok (map-get? tournaments { tournament-id: tournament-id }))
+)
+
+(define-read-only (get-tournament-participant (tournament-id uint) (participant principal))
+    (ok (map-get? tournament-participants { tournament-id: tournament-id, participant: participant }))
+)
+
+(define-read-only (get-match-info (match-id uint))
+    (ok (map-get? tournament-matches { match-id: match-id }))
+)
+
+(define-read-only (get-round-info (tournament-id uint) (round uint))
+    (ok (map-get? tournament-rounds { tournament-id: tournament-id, round: round }))
+)
+
+(define-read-only (is-tournament-participant (tournament-id uint) (player principal))
+    (is-some (map-get? tournament-participants { tournament-id: tournament-id, participant: player }))
+)
